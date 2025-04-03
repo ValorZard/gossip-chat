@@ -324,6 +324,7 @@ impl App {
             sender.broadcast(message.to_vec().into()).await?;
         }
 
+        /*
         // subscribe and print loop
         tokio::spawn(subscribe_loop(receiver));
 
@@ -347,7 +348,8 @@ impl App {
             // print to ourselves the text that we sent
             println!("> sent: {text}");
         }
-
+        */
+        
         loop {
             terminal.draw(|frame| self.draw(frame))?;
 
