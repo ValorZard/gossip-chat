@@ -6,7 +6,7 @@ use crossterm::event::{self, Event as CrosstermEvent, KeyCode, KeyEventKind};
 use futures_lite::StreamExt;
 use iroh::{Endpoint, NodeAddr, NodeId, protocol::Router};
 use iroh_gossip::{
-    net::{Event, Gossip, GossipEvent, GossipReceiver},
+    net::{Event, Gossip, GossipEvent, GossipReceiver, GossipSender},
     proto::TopicId,
 };
 use ratatui::layout::{Constraint, Layout, Position};
@@ -75,7 +75,7 @@ impl Message {
 }
 
 // Handle incoming events
-async fn subscribe_loop(mut receiver: GossipReceiver) -> Result<()> {
+async fn subscribe_loop(mut receiver: GossipReceiver, message_tx: tokio::sync::mpsc::Sender<String>) -> Result<()> {
     // keep track of the mapping between `NodeId`s and names
     let mut names = HashMap::new();
     // iterate over all events
@@ -90,7 +90,7 @@ async fn subscribe_loop(mut receiver: GossipReceiver) -> Result<()> {
                     // add and entry into the map
                     // and print the name
                     names.insert(from, name.clone());
-                    println!("> {} is now known as {}", from.fmt_short(), name);
+                    message_tx.send(format!("> {} is now known as {}", from.fmt_short(), name)).await?;
                 }
                 Message::Message { from, text } => {
                     // if it's a `Message` message,
@@ -99,7 +99,7 @@ async fn subscribe_loop(mut receiver: GossipReceiver) -> Result<()> {
                     let name = names
                         .get(&from)
                         .map_or_else(|| from.fmt_short(), String::to_string);
-                    println!("{}: {}", name, text);
+                    message_tx.send(format!("{}: {}", name, text)).await?;
                 }
             }
         }
@@ -173,6 +173,7 @@ struct App {
     endpoint: Option<Endpoint>,
     router: Option<Router>,
     name: Option<String>,
+    sender: Option<GossipSender>,
 }
 
 enum InputMode {
@@ -205,6 +206,7 @@ impl App {
             name: args.name.clone(),
             endpoint: None,
             router: None,
+            sender: None,
         })
     }
 
@@ -266,8 +268,16 @@ impl App {
         self.character_index = 0;
     }
 
-    fn submit_message(&mut self) {
+    async fn submit_message(&mut self) {
         self.messages.push(self.input.clone());
+        let message = Message::Message {
+            from: self.endpoint.as_ref().unwrap().node_id(),
+            text: self.input.clone(),
+        };
+        // broadcast the encoded message
+        if let Some(sender) = &self.sender {
+            sender.broadcast(message.to_vec().into()).await.unwrap();
+        }
         self.input.clear();
         self.reset_cursor();
     }
@@ -324,10 +334,12 @@ impl App {
             sender.broadcast(message.to_vec().into()).await?;
         }
 
-        /*
-        // subscribe and print loop
-        tokio::spawn(subscribe_loop(receiver));
+        // create a multi-provider, single-consumer channel
+        let (message_tx, mut message_rx) = tokio::sync::mpsc::channel::<String>(1);
+        
+        tokio::spawn(subscribe_loop(receiver, message_tx.clone()));
 
+        /*
         // spawn an input thread that reads stdin
         // create a multi-provider, single-consumer channel
         let (line_tx, mut line_rx) = tokio::sync::mpsc::channel(1);
@@ -349,32 +361,47 @@ impl App {
             println!("> sent: {text}");
         }
         */
-        
+
+        self.sender = Some(sender);
+        self.endpoint = Some(endpoint);
+
+        // clear screen of junk 
+        terminal.clear()?;
+
         loop {
             terminal.draw(|frame| self.draw(frame))?;
 
-            if let CrosstermEvent::Key(key) = event::read()? {
-                match self.input_mode {
-                    InputMode::Normal => match key.code {
-                        KeyCode::Char('e') => {
-                            self.input_mode = InputMode::Editing;
-                        }
-                        KeyCode::Char('q') => {
-                            router.shutdown().await?;
-                            return Ok(());
-                        }
-                        _ => {}
-                    },
-                    InputMode::Editing if key.kind == KeyEventKind::Press => match key.code {
-                        KeyCode::Enter => self.submit_message(),
-                        KeyCode::Char(to_insert) => self.enter_char(to_insert),
-                        KeyCode::Backspace => self.delete_char(),
-                        KeyCode::Left => self.move_cursor_left(),
-                        KeyCode::Right => self.move_cursor_right(),
-                        KeyCode::Esc => self.input_mode = InputMode::Normal,
-                        _ => {}
-                    },
-                    InputMode::Editing => {}
+            // get messages from other clients
+            while let Some(message) = message_rx.try_recv().ok() {
+                self.messages.push(message);
+            }
+
+            // poll to get input from user (and not to block the app)
+            if crossterm::event::poll(std::time::Duration::from_millis(16))? {
+                // read the event
+                if let CrosstermEvent::Key(key) = event::read()? {
+                    match self.input_mode {
+                        InputMode::Normal => match key.code {
+                            KeyCode::Char('e') => {
+                                self.input_mode = InputMode::Editing;
+                            }
+                            KeyCode::Char('q') => {
+                                router.shutdown().await?;
+                                return Ok(());
+                            }
+                            _ => {}
+                        },
+                        InputMode::Editing if key.kind == KeyEventKind::Press => match key.code {
+                            KeyCode::Enter => self.submit_message().await,
+                            KeyCode::Char(to_insert) => self.enter_char(to_insert),
+                            KeyCode::Backspace => self.delete_char(),
+                            KeyCode::Left => self.move_cursor_left(),
+                            KeyCode::Right => self.move_cursor_right(),
+                            KeyCode::Esc => self.input_mode = InputMode::Normal,
+                            _ => {}
+                        },
+                        InputMode::Editing => {}
+                    }
                 }
             }
         }
